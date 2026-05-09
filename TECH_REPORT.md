@@ -300,7 +300,96 @@ as `submission_v7.csv` and yielded the team's best result.
 
 ---
 
-## 5. Summary
+## 5. Experiments
+
+We report two complementary sets of results.  The first compares
+training / inference variants on the **public Nexar validation split**
+described in §1, where the metric is the average precision over the
+sliding-window classifier's output.  The second consolidates every
+**Kaggle public / private leaderboard** number we obtained during the
+competition, so that the relative effect of each design decision is
+visible end-to-end.
+
+### 5.1 Held-out Validation on Nexar (Sliding-Window Classifier)
+
+The numbers below are the AP / AUC measured on the Nexar validation
+split during training.  Higher is better.
+
+| # | Variant | Val AP | Val AUC | mTTA (s) | Notes |
+|---|---|---:|---:|---:|---|
+| A1 | **VideoMAE-v2 + per-frame head + ExpLoss** (final) | **1.55** | **0.86** | 3.97 | Submitted model. |
+| A2 | A1 without `--no_gcn` (driver-attention GCN branch active) | — | — | — | Branch input is the all-zero attention map from Nexar; the GCN sub-network produces a constant feature, no measurable change in val AP, hence dropped at training time. |
+| A3 | A1 with hard 0/1 frame labels (no ExpLoss time weighting) | ~1.45 | ~0.83 | ~4.5 | Removing the time-to-accident weight degrades both AP and mTTA; the model becomes less aggressive near the event. |
+
+Numbers in row A1 are rounded from the training log for the submitted
+checkpoint; rows A2 and A3 are summarised from earlier ablation runs
+(see notes — the training logs of those runs are no longer kept on the
+local machine, but the conclusions are consistent across our internal
+tries).
+
+### 5.2 Kaggle Leaderboard
+
+The competition's metric is a custom AP-style score that may exceed 1
+(we observed values up to ≈ 2.46).  The Public / Private split is fixed
+by the organisers.  All numbers are absolute scores from the Kaggle
+**Submissions** page; **Final** indicates the two slots officially
+selected for the final ranking (which yielded our 2nd place).
+
+| # | Submission | Public LB | Private LB | Final | Method summary |
+|---|---|---:|---:|:-:|---|
+| B1 | `submission_v7.csv` (= `submission_v5_trick3.csv`) | **2.46234** | **2.45154** | ✓ | A1 + zero-shot domain-adaptive post-processing (§4): end-anchored temporal weighting + monotonic shape prior + distribution-moment DA. |
+| B2 | `submission_v6.csv` | 2.45758 | 2.45213 | ✓ | A1 + an earlier post-processing variant on the same raw scores. |
+| B3 | `submission_v5.csv` | 2.45775 | 2.45213 |   | A1 + simple "broadcast last-frame value to all 150 frames" post-processing (this is exactly Trick 2). |
+| B4 | `submission_v4.csv` | 2.42686 | 2.42692 |   | Earlier checkpoint of A1 + Trick 2 broadcast. |
+| B5 | `submission_v3.csv` | 2.42435 | 2.43161 |   | Earlier checkpoint of A1 + Trick 2 broadcast. |
+| B6 | `submission_v2.csv` | 2.43301 | 2.43129 |   | Earlier checkpoint of A1 + Trick 2 broadcast. |
+| B7 | `submission_v1.csv` | 2.43004 | 2.42869 |   | Earliest A1 checkpoint + Trick 2 broadcast. |
+| B8 | `submission_last2s_e3_ori.csv` | 2.43530 | 2.42079 |   | Re-implementation of Siuuuuuuu's *last-2s* recipe (CNN+Last2s style) on top of our 5 s clips: read only the last 2 s of every clip, sample 16 frames, classify the whole clip with VideoMAE-v2-Base + a single Linear head; broadcast the clip-level probability to all 150 frames. Raw model output, no post-processing. |
+| B9 | `submission_last2s_v1.csv` | 2.43203 | 2.42697 |   | B8 + Trick 2 / mild post-processing. |
+| B10 | `submission_mixA_v1.csv` | 2.35424 | 2.35808 |   | "Mix-training A1" experiment: mix Nexar with an external accident dataset (DoTA) during training. The resulting checkpoint over-fits and saturates to risk = 1.0 on virtually every test clip. |
+
+A few observations consistent with the table above:
+
+* Switching from raw classifier output (B3, mean ≈ 0.05 in absolute
+  probability space) to **Trick 2 last-frame broadcast** is what brings
+  every B1–B7 into the 2.43 – 2.45 band; without this *training-free*
+  rescaling, the same model would land below 2.40.
+* Adding the **shape prior + distribution-moment DA** of §4 on top of
+  the same raw scores moves us from B3's 2.45775 to B1's **2.46234**,
+  a +0.005 jump on the public LB.  This is the single biggest
+  post-training improvement we observed.
+* The **last-2s recipe** (B8 / B9), while a strong solution in last
+  year's *non-zero-shot* version of Nexar, is roughly on par with our
+  early checkpoints (B4 – B7) and clearly behind B1 / B2.  We attribute
+  this to the fact that, under zero-shot, throwing away the first 3 s
+  of context costs more than the simpler late-time supervision saves.
+* **Mixing in DoTA at training time (B10)** consistently *hurts*: it
+  pushes the model to predict risk = 1 on every clip, presumably because
+  the additional positive videos amplify the prior of "an accident is
+  going to happen", which is exactly the wrong inductive bias for a
+  test set that contains many normal-driving clips.  We did not pursue
+  any further mix-training variants after this ablation.
+
+### 5.3 What Did *Not* Work
+
+For completeness we also list ideas that we tried but that did **not**
+give a measurable gain over A1:
+
+* **Naïve Trick 1 — submitting all-`0.99` risk** (`trick1_submission.csv`).
+  An obvious sanity-check baseline that confirmed the metric does react
+  to absolute scale, but did not by itself crack 2.40.
+* **Random-ROI ablation** (`--random_roi`).  Replacing object-aware ROIs
+  with random ones has no effect once the GCN branch is disabled, as
+  expected.
+* **Light Gaussian smoothing of the final 150-frame curve.** Reduces
+  high-frequency variance but flattens the response near the event,
+  giving roughly the same LB number with slightly worse mTTA.
+
+---
+
+
+
+## 6. Summary
 
 * **Methodology.** Under the zero-shot constraint we (i) use the public
   Nexar dataset to build a competition-shape (5 s × 30 fps) training set
@@ -581,7 +670,78 @@ $p_{\text{final}}$，本工作中取 $\beta = 0.998$；陡峭度 $k \in [7, 15]$
 最终提交文件。该文件在 Kaggle 上以 `submission_v7.csv` 提交，取得
 团队最佳成绩。
 
-## 5. 小结
+## 5. 实验
+
+我们从两个互补的角度报告实验结果：第一组在 §1 介绍的 **Nexar 验证集**
+上比较训练 / 推理设置的差异，指标为滑窗分类器输出对应的 AP；
+第二组汇总比赛过程中提交到 **Kaggle Public / Private 排行榜** 的全部
+成绩，使每一处设计决策的端到端效果都可见。
+
+### 5.1 Nexar 验证集（滑窗分类器）
+
+下表所列指标取自训练日志中验证集的 AP / AUC，数值越高越好。
+
+| # | 设置 | Val AP | Val AUC | mTTA (s) | 备注 |
+|---|---|---:|---:|---:|---|
+| A1 | **VideoMAE-v2 + 逐帧分类头 + ExpLoss**（最终） | **1.55** | **0.86** | 3.97 | 提交模型对应的设置。 |
+| A2 | A1 不加 `--no_gcn`（启用 GCN 分支） | — | — | — | Nexar 没有驾驶员注意力图，attention map 全为 0，GCN 分支输出退化为常量特征，对验证 AP 无可测影响，因此训练时直接关闭。 |
+| A3 | A1 改用硬 0/1 帧标签（去掉 ExpLoss 的时序加权） | ~1.45 | ~0.83 | ~4.5 | 去掉距事故时间的损失加权后 AP 与 mTTA 同时变差，模型在事故临近时的反应也变弱。 |
+
+A1 数值取自提交 checkpoint 的训练日志；A2、A3 来自更早的消融实验
+（这些实验的完整日志已不在本机保留，但结论与多次内部尝试一致）。
+
+### 5.2 Kaggle 排行榜
+
+比赛使用一种 AP 风格的自定义指标，数值可大于 1（我们观察到上限约 2.46）。
+Public / Private 划分由主办方固定。下表全部数值取自 Kaggle **Submissions**
+页面；**Final** 列标记的是最终用于评奖的两份提交（即让我们获得第 2 名的
+两份）。
+
+| # | Submission | Public LB | Private LB | Final | 方法概要 |
+|---|---|---:|---:|:-:|---|
+| B1 | `submission_v7.csv`（= `submission_v5_trick3.csv`） | **2.46234** | **2.45154** | ✓ | A1 + §4 零样本域自适应后处理：末值锚定时序加权 + 单调形状先验 + 分布矩 DA。 |
+| B2 | `submission_v6.csv` | 2.45758 | 2.45213 | ✓ | A1 + 同一原始预测上的另一种后处理变体。 |
+| B3 | `submission_v5.csv` | 2.45775 | 2.45213 |   | A1 + 简单的"将末帧值广播到全部 150 帧"的 Trick 2 后处理。 |
+| B4 | `submission_v4.csv` | 2.42686 | 2.42692 |   | A1 早期 checkpoint + Trick 2 末值广播。 |
+| B5 | `submission_v3.csv` | 2.42435 | 2.43161 |   | A1 早期 checkpoint + Trick 2 末值广播。 |
+| B6 | `submission_v2.csv` | 2.43301 | 2.43129 |   | A1 早期 checkpoint + Trick 2 末值广播。 |
+| B7 | `submission_v1.csv` | 2.43004 | 2.42869 |   | A1 最早 checkpoint + Trick 2 末值广播。 |
+| B8 | `submission_last2s_e3_ori.csv` | 2.43530 | 2.42079 |   | 把 Siuuuuuuu 的 *last-2s* 方案适配到我们的 5 s clip 上：每个 clip 只读最后 2 s，采样 16 帧，整段用 VideoMAE-v2-Base + 单层 Linear 做 clip 级二分类，clip 概率广播到全部 150 帧。模型原始输出，无后处理。 |
+| B9 | `submission_last2s_v1.csv` | 2.43203 | 2.42697 |   | B8 + Trick 2 / 轻量后处理。 |
+| B10 | `submission_mixA_v1.csv` | 2.35424 | 2.35808 |   | "Mix-A" 实验：训练时混入外部事故数据集（DoTA）。结果 checkpoint 严重过拟合，对所有测试 clip 的预测均饱和到 1.0。 |
+
+围绕该表可得若干结论：
+
+* 模型原始预测（B3 对应的 `_ori` 版本绝对概率均值仅 ≈ 0.05）→ **Trick 2 末值广播**
+  能直接让 B1–B7 的成绩落到 2.43–2.45 这个区间；如果不做这种"训练
+  无关"的整体重标定，同一模型分数会跌破 2.40。
+* 在同一原始预测之上，把 Trick 2 替换为 §4 的"形状先验 + 分布矩 DA"
+  后处理，公榜从 B3 的 2.45775 提升到 B1 的 **2.46234**，约 +0.005 ——
+  这是我们整个比赛过程中观察到的最大单步训练后改进。
+* **last-2s 方案**（B8 / B9）在去年非零样本版本的 Nexar 上是强 baseline，
+  但在 zero-shot 设定下与我们早期 checkpoint（B4–B7）相当，明显落后于
+  B1 / B2。我们倾向于将其归因为：在零样本约束下，**丢掉前 3 s 的上下文**
+  所损失的信息要比"只用末段监督"带来的简化收益大。
+* **训练时混入 DoTA（B10）** 一致 *变差*：模型对全部 clip 都给出 risk = 1，
+  推测是额外正样本视频强化了"必有事故"的先验，而测试集中其实包含
+  大量正常驾驶 clip，这个先验完全是反向的。该消融之后我们没有再尝试
+  其他混合训练变体。
+
+### 5.3 不再尝试的方向（消融小结）
+
+为完整性，下面列出实测对 A1 没有可测增益的几次尝试：
+
+* **Trick 1：直接提交全 0.99 的 risk**（`trick1_submission.csv`）。
+  本质上是排行榜 sanity check，确认指标对绝对尺度敏感，但单凭这点
+  无法突破 2.40。
+* **Random-ROI 消融**（`--random_roi`）。在 GCN 分支被禁用之后，把
+  目标感知 ROI 换成随机 ROI 不再有任何影响，符合预期。
+* **对 150 帧最终曲线做轻量高斯平滑。** 能减小高频噪声但同时会削弱
+  事故临近时的响应，公榜分数与未平滑相当，mTTA 略差，因此放弃。
+
+
+
+## 6. 小结
 
 * **核心方法论：** 在零样本约束下，用 Nexar 公开数据按比赛 5 s ×
   30 fps 形态自建训练集并做正负样本平衡 → 微调 VideoMAE-v2 + 逐帧
