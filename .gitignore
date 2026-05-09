@@ -1,0 +1,33 @@
+# Model weights — released via Hugging Face, see README.md
+models/*.pth
+models/*.bin
+models/*.safetensors
+
+# Training logs — kept locally for archival, not pushed
+logs/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.so
+
+# Environments
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local test outputs
+submission_*.csv
+!examples/submission_*.csv    # keep sample submissions if ever added
+smoke_test_output.csv
+
+# Data (raw Nexar / DADA / competition frames)
+data/
