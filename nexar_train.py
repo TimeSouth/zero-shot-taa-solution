@@ -1,12 +1,8 @@
 """
-Nexar 5s Clip VideoMAE + GCN 训练脚本
-复用 dada_videomae 的模型和损失函数，适配 Nexar clips_5s 数据集。
+Stage 2 — Training entry point.
 
-用法:
-  python nexar/nexar_train.py
-  python nexar/nexar_train.py --global_16f --epochs 15
-  python nexar/nexar_train.py --no_gcn --global_16f    # 禁用 GCN（Nexar 无 attention map）
-  python nexar/nexar_train.py --debug                   # Debug 模式
+Fine-tunes VideoMAE-v2 + per-frame classifier on the 5 s Nexar clips
+produced by `process_5s_clips.py`.  See Section 2 of `TECH_REPORT.md`.
 """
 
 import argparse
@@ -35,7 +31,9 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, StepLR
 from collections import defaultdict
 from sklearn.metrics import roc_auc_score, average_precision_score
 
+# ----------------------------------------------------------------------
 # Allow running this script directly from the repository root.
+# ----------------------------------------------------------------------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from nexar_config import *
@@ -44,23 +42,6 @@ from videomae_gcn import (
     VideoMAEGCNModel, VideoMAEGCNModelV2, freeze_backbone_layers,
     get_videomae_backbone, get_inner_model, extract_videomae_tokens,
 )
-
-# ----------------------------------------------------------------------
-# Optional: DADA-1000 cross-dataset validation.
-# `--eval_dada` and `--mix_dada_train` rely on the `dada_videomae` package,
-# which is not part of this submission (it lives in our internal driver-
-# attention research codebase).  When the package is missing we silently
-# disable those flags so the rest of the training pipeline still works.
-# ----------------------------------------------------------------------
-try:
-    import dada_videomae.config as dada_cfg
-    from dada_videomae.dataset import DADAVideoMAEDataset, DADAGlobalDataset
-    _HAS_DADA = True
-except ImportError:
-    dada_cfg = None
-    DADAVideoMAEDataset = None
-    DADAGlobalDataset = None
-    _HAS_DADA = False
 
 
 def parse_args():
@@ -93,10 +74,6 @@ def parse_args():
                         help="禁用 GCN 分支（推荐，因为 Nexar 无 attention map）")
     parser.add_argument("--random_roi", action="store_true",
                         help="消融实验: ROI 使用随机采样")
-    parser.add_argument("--pretrained_dada", type=str, default=None,
-                        help="从 DADA-1000 预训练的 checkpoint 初始化（迁移学习）")
-    parser.add_argument("--eval_dada", action="store_true",
-                        help="训练和验证时同时在 DADA-1000 数据集上评估")
     # ---- 混合数据集训练 ----
     parser.add_argument("--mix_dota", action="store_true",
                         help="混合 DoTA 数据集训练（正样本，只取 anomaly_start 之前的帧）")
@@ -108,8 +85,6 @@ def parse_args():
                         ),
                         help="DoTA processed dataset root (only used by "
                              "--mix_dota; defaults to $DOTA_ROOT).")
-    parser.add_argument("--mix_dada_train", action="store_true",
-                        help="混合 DADA-1000 训练集训练")
     parser.add_argument("--nexar_ann_train", type=str, default=None,
                         help="自定义 Nexar 训练标注文件（如未平衡版本），默认用 nexar_config 中的 ANN_TRAIN")
     parser.add_argument("--balance_mix", type=float, default=0,
@@ -177,7 +152,7 @@ def collate_fn(batch):
     return rgb, attn, labels, metas
 
 
-# ============ 损失函数（复用 dada_videomae）============
+# ============ 损失函数 ============
 
 class ExpLoss(nn.Module):
     """
@@ -363,87 +338,6 @@ def validate_last2s(model, val_loader, criterion, device, temperature=2.0):
     return avg_loss, accuracy, auc, ap
 
 
-def _eval_dada_with_last2s(model, dada_val_ds, dada_val_loader, device, logger,
-                           original_fps=30):
-    """
-    用 last2s 二分类模型在 DADA-1000 上做完整逐帧评估（方案B）。
-
-    思路:
-    1. DADAGlobalDataset 已将每个 clip 降采样到 16帧（与 last2s 输入一致）
-    2. 将 16帧输入 VideoMAEClassifier → 得到 clip 级 collision 概率 p
-    3. 将 p 映射为 150帧的逐帧概率：全部填 p（与推理策略一致）
-    4. 用标准 AP/mTTA 评估
-    """
-    model.eval()
-    ds = dada_val_ds.dataset if hasattr(dada_val_ds, 'dataset') else dada_val_ds
-
-    # 收集每个 window 的 clip 级概率
-    # DADAGlobalDataset 每个 clip 一个 window，所以 window_idx == clip_idx
-    clip_probs = {}
-    win_counter = 0
-
-    with torch.no_grad():
-        for rgb, attn, labels, metas in dada_val_loader:
-            rgb = rgb.to(device)
-            with amp_autocast(enabled=USE_AMP):
-                logits = model(rgb)  # (B, 2)
-            probs = torch.softmax(logits, dim=-1)[:, 1].cpu().numpy()
-
-            for i in range(rgb.size(0)):
-                # 从 meta 中取 clip_idx（DADAGlobalDataset 的 meta 有 clip_idx）
-                clip_idx = metas[i].get('clip_idx', win_counter)
-                clip_probs[clip_idx] = float(probs[i])
-                win_counter += 1
-
-    # 构建逐帧概率序列
-    all_pred = []
-    all_labels = []
-    all_toas = []
-    all_starts = []
-
-    for clip_idx in sorted(clip_probs.keys()):
-        if clip_idx >= len(ds.clips):
-            continue
-        clip = ds.clips[clip_idx]
-        clip_length = clip.end - clip.start + 1  # 通常 150
-        p = clip_probs[clip_idx]
-
-        # 全部填 p（flat 策略，与推理一致）
-        frame_probs = np.full(clip_length, p, dtype=np.float32)
-
-        # DADA-1000: toa 是绝对帧号，正样本需减去 start 转为相对帧号
-        if clip.label > 0:
-            toa_out = clip.toa - clip.start
-        else:
-            toa_out = clip.toa
-
-        all_pred.append(frame_probs)
-        all_labels.append(clip.label)
-        all_toas.append(toa_out)
-        all_starts.append(clip.start)
-
-    if len(all_pred) == 0:
-        logger.info("  Val[DADA]: 无有效预测")
-        return 0.0
-
-    # 计算指标
-    AP, mTTA, TTA_R80 = compute_ap_mtta(all_pred, all_labels, all_toas, original_fps)
-    auc = compute_auc(all_pred, all_labels, all_toas)
-    std_ap = compute_standard_ap(all_pred, all_labels, all_toas)
-    tta05 = compute_tta05(all_pred, all_labels, all_toas, original_fps)
-
-    pos_clips = sum(1 for l in all_labels if l == 1)
-    logger.info(
-        f"  Val[DADA]: clips={len(all_labels)} (pos={pos_clips})"
-    )
-    logger.info(
-        f"  Val[DADA]: AP={AP:.4f} sAP={std_ap:.4f} AUC={auc:.4f} "
-        f"TTA@0.5={tta05:.2f}s mTTA={mTTA:.2f}s TTA@R80={TTA_R80:.2f}s"
-    )
-
-    return AP
-
-
 def train_last2s(args):
     """
     Last-2s 方案训练主函数。
@@ -465,34 +359,8 @@ def train_last2s(args):
     logger.info(f"  temperature={args.temperature}")
     logger.info(f"  balance={not args.no_balance}")
     logger.info(f"  freeze_backbone_layers={args.freeze_backbone_layers}")
-    logger.info(f"  eval_dada={args.eval_dada}")
     logger.info(f"  weights_dir={weights_dir}")
     logger.info("=" * 60)
-
-    logger.info(f"  eval_dada={args.eval_dada}")
-
-    # ---- DADA-1000 验证（可选，方案B：clip级概率 → 逐帧概率 → AP/mTTA）----
-    dada_val_ds = None
-    dada_val_loader = None
-    if args.eval_dada:
-        logger.info("[DADA-1000] 加载 DADA-1000 验证数据集（全局16帧模式）...")
-        dada_val_ds = DADAGlobalDataset(
-            ann_file=dada_cfg.ANN_TEST,
-            rgb_root=dada_cfg.DATA_ROOT_TEST,
-            attn_root=dada_cfg.ATTN_ROOT_TEST,
-            target_frames=args.last2s_frames,  # 16帧，与 last2s 模型输入一致
-            sample_fps=SAMPLE_FPS,
-            original_fps=dada_cfg.FPS,
-            img_size=IMG_SIZE,
-            is_train=False,
-        )
-        dada_val_loader = DataLoader(
-            dada_val_ds, batch_size=VAL_BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS, pin_memory=True,
-            worker_init_fn=worker_init_fn, collate_fn=collate_fn,
-        )
-        dada_clips = dada_val_ds.dataset.clips if hasattr(dada_val_ds, 'dataset') else dada_val_ds.clips
-        logger.info(f"[DADA-1000] Val windows: {len(dada_val_ds)}, Val clips: {len(dada_clips)}")
 
     # ---- 数据集 ----
     balance = not args.no_balance
@@ -550,21 +418,6 @@ def train_last2s(args):
         frozen_count = freeze_backbone_layers(model, args.freeze_backbone_layers)
         logger.info(f"  冻结 backbone 前 {args.freeze_backbone_layers} 层"
                     f"（共冻结 {frozen_count} 个参数）")
-
-    # 从 DADA-1000 或其他 checkpoint 初始化
-    if args.pretrained_dada:
-        logger.info(f"从预训练 checkpoint 初始化 backbone: {args.pretrained_dada}")
-        ckpt = torch.load(args.pretrained_dada, map_location=device)
-        state_dict = ckpt.get("model", ckpt)
-        # 只加载 backbone 相关权重
-        backbone_state = {k: v for k, v in state_dict.items() if k.startswith("backbone.")}
-        if backbone_state:
-            missing, unexpected = model.load_state_dict(backbone_state, strict=False)
-            logger.info(f"  加载了 {len(backbone_state)} 个 backbone 权重")
-        else:
-            # 尝试全量加载（跳过不匹配的）
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            logger.info(f"  Missing: {len(missing)}, Unexpected: {len(unexpected)}")
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -657,26 +510,15 @@ def train_last2s(args):
             model, val_loader, criterion, device, temperature=temperature
         )
 
-        # ---- DADA-1000 验证（方案B：clip级概率 → 逐帧概率 → AP/mTTA）----
-        dada_val_AP = 0.0
-        if dada_val_loader is not None:
-            dada_val_AP = _eval_dada_with_last2s(
-                model, dada_val_ds, dada_val_loader, device, logger,
-                original_fps=dada_cfg.FPS,
-            )
-
         elapsed = time.time() - t0
         train_avg_loss = epoch_loss / max(epoch_samples, 1)
         train_acc = epoch_correct / max(epoch_samples, 1) * 100
 
-        dada_info = ""
-        if dada_val_loader is not None:
-            dada_info = f" | DADA: AP={dada_val_AP:.4f}"
         logger.info(
             f"Epoch {epoch+1}/{args.epochs} [{elapsed:.0f}s] "
             f"train_loss={train_avg_loss:.4f} train_acc={train_acc:.1f}% | "
             f"val_loss={val_loss:.4f} val_acc={val_acc:.1f}% "
-            f"val_AUC={val_auc:.4f} val_AP={val_ap:.4f}{dada_info}"
+            f"val_AUC={val_auc:.4f} val_AP={val_ap:.4f}"
         )
 
         # ---- 保存 checkpoint ----
@@ -922,122 +764,6 @@ def compute_standard_ap(all_pred, all_labels, all_toas):
         return 0.0
 
 
-# ============ DADA-1000 验证用的 aggregate（toa 是绝对帧号，需减 start）============
-
-def aggregate_clip_predictions_dada(val_dataset, window_preds, sample_fps, original_fps):
-    """DADA-1000 专用: toa 是绝对帧号，正样本需减去 start 转为相对帧号。"""
-    frame_interval = max(1, original_fps // sample_fps)
-    clip_frame_preds = defaultdict(lambda: defaultdict(list))
-
-    for win_idx, probs in window_preds.items():
-        if hasattr(val_dataset, 'dataset'):
-            real_idx = val_dataset.indices[win_idx]
-            ds = val_dataset.dataset
-        else:
-            real_idx = win_idx
-            ds = val_dataset
-        clip_idx, win_indices, win_start = ds.windows[real_idx]
-        for t, rel_idx in enumerate(win_indices[:len(probs)]):
-            sampled_pos = rel_idx // frame_interval
-            clip_frame_preds[clip_idx][sampled_pos].append(probs[t])
-
-    all_pred, all_labels, all_toas, all_starts = [], [], [], []
-    ds = val_dataset.dataset if hasattr(val_dataset, 'dataset') else val_dataset
-
-    for clip_idx in sorted(clip_frame_preds.keys()):
-        clip = ds.clips[clip_idx]
-        clip_length = clip.end - clip.start + 1
-        num_sampled = len(range(0, clip_length, frame_interval))
-        sampled_probs = np.zeros(num_sampled, dtype=np.float32)
-        for pos, prob_list in clip_frame_preds[clip_idx].items():
-            if pos < num_sampled:
-                sampled_probs[pos] = np.mean(prob_list)
-        frame_probs = np.zeros(clip_length, dtype=np.float32)
-        if num_sampled >= 2:
-            sampled_positions = np.arange(num_sampled) * frame_interval
-            frame_probs = np.interp(
-                np.arange(clip_length), sampled_positions, sampled_probs
-            ).astype(np.float32)
-        elif num_sampled == 1:
-            frame_probs[:] = sampled_probs[0]
-
-        # DADA-1000: toa 是绝对帧号，正样本需减去 start
-        if clip.label > 0:
-            toa_out = clip.toa - clip.start
-        else:
-            toa_out = clip.toa
-
-        all_pred.append(frame_probs)
-        all_labels.append(clip.label)
-        all_toas.append(toa_out)
-        all_starts.append(clip.start)
-
-    return all_pred, all_labels, all_toas, all_starts
-
-
-# ============ DADA-1000 验证用的 ExpLoss（toa 需减 start）============
-
-class ExpLossDADA(nn.Module):
-    """DADA-1000 专用 ExpLoss: toa 是绝对帧号，需减去 clip_start。"""
-
-    def __init__(self, loss_scale=None, clip_weight=0.0):
-        super().__init__()
-        self.ce_loss = nn.CrossEntropyLoss(reduction='none')
-        self.loss_scale = loss_scale if loss_scale is not None else LOSS_SCALE
-        self.clip_weight = clip_weight
-
-    def forward(self, logits, target, metas=None):
-        B, T, _ = logits.shape
-        device = logits.device
-        logits_flat = logits.reshape(B * T, 2)
-        target_onehot = torch.zeros(B * T, 2, device=device, dtype=torch.float32)
-        target_cls = torch.zeros(B * T, device=device, dtype=torch.long)
-        toa_vec = torch.zeros(B * T, device=device, dtype=torch.float32)
-        time_vec = torch.zeros(B * T, device=device, dtype=torch.float32)
-
-        for b in range(B):
-            clip_label = metas[b]['label'] if metas is not None else 0
-            toa_raw = metas[b]['toa'] if metas is not None else 0
-            clip_start = metas[b]['start'] if metas is not None else 0
-            win_indices = metas[b].get('win_indices', None) if metas is not None else None
-            # DADA-1000: 正样本 toa 需减去 start
-            if clip_label == 1:
-                toa_orig = toa_raw - clip_start
-            else:
-                toa_orig = toa_raw
-            for t in range(T):
-                idx = b * T + t
-                if clip_label == 1:
-                    target_onehot[idx, 1] = 1.0
-                    target_cls[idx] = 1
-                else:
-                    target_onehot[idx, 0] = 1.0
-                    target_cls[idx] = 0
-                toa_vec[idx] = toa_orig
-                if win_indices is not None:
-                    t_clamped = min(t, len(win_indices) - 1)
-                    time_vec[idx] = win_indices[t_clamped]
-                else:
-                    time_vec[idx] = t
-
-        penalty = -torch.max(
-            torch.zeros_like(toa_vec),
-            (toa_vec - time_vec - 1) / dada_cfg.FPS
-        )
-        ce = self.ce_loss(logits_flat, target_cls)
-        pos_loss = -torch.mul(torch.exp(penalty), -ce)
-        neg_loss = ce
-        pos_mask = target_onehot[:, 1]
-        neg_mask = target_onehot[:, 0]
-        n_pos = pos_mask.sum().clamp(min=1)
-        n_neg = neg_mask.sum().clamp(min=1)
-        pos_loss_mean = (pos_loss * pos_mask).sum() / n_pos
-        neg_loss_mean = (neg_loss * neg_mask).sum() / n_neg
-        loss = 0.5 * pos_loss_mean + 0.5 * neg_loss_mean
-        loss = loss * self.loss_scale
-        return loss
-
-
 # ============ 验证 ============
 
 def validate(model, val_loader, val_dataset, loss_fn, device, logger, sample_fps, original_fps,
@@ -1077,15 +803,9 @@ def validate(model, val_loader, val_dataset, loss_fn, device, logger, sample_fps
 
     avg_loss = total_loss / max(total_samples, 1)
 
-    # 根据数据集类型选择不同的 aggregate 函数
-    if dataset_name == "DADA":
-        all_pred, all_labels, all_toas, all_starts = aggregate_clip_predictions_dada(
-            val_dataset, window_preds, sample_fps, original_fps
-        )
-    else:
-        all_pred, all_labels, all_toas, all_starts = aggregate_clip_predictions(
-            val_dataset, window_preds, sample_fps, original_fps
-        )
+    all_pred, all_labels, all_toas, all_starts = aggregate_clip_predictions(
+        val_dataset, window_preds, sample_fps, original_fps
+    )
 
     eval_fps = original_fps
     AP, mTTA, TTA_R80 = compute_ap_mtta(all_pred, all_labels, all_toas, eval_fps)
@@ -1127,9 +847,7 @@ def train(args):
     logger.info(f"  freeze_backbone_layers={args.freeze_backbone_layers}")
     logger.info(f"  loss_scale={args.loss_scale if args.loss_scale is not None else LOSS_SCALE}")
     logger.info(f"  no_gcn={args.no_gcn}, random_roi={args.random_roi}")
-    logger.info(f"  pretrained_dada={args.pretrained_dada}")
-    logger.info(f"  eval_dada={args.eval_dada}")
-    logger.info(f"  mix_dota={args.mix_dota}, mix_dada_train={args.mix_dada_train}")
+    logger.info(f"  mix_dota={args.mix_dota}")
     logger.info(f"  weights_dir={weights_dir}")
     logger.info("=" * 60)
 
@@ -1204,22 +922,6 @@ def train(args):
         else:
             logger.warning(f"  DoTA 标注文件不存在: {dota_ann_train}")
 
-    if args.mix_dada_train:
-        if os.path.exists(dada_cfg.ANN_TRAIN):
-            logger.info(f"[混合训练] 加载 DADA-1000 训练数据...")
-            dada_train_ds = DADAVideoMAEDataset(
-                ann_file=dada_cfg.ANN_TRAIN,
-                rgb_root=dada_cfg.DATA_ROOT_TRAIN,
-                attn_root=dada_cfg.ATTN_ROOT_TRAIN,
-                window_size=WINDOW_SIZE, window_stride=args.window_stride,
-                sample_fps=args.sample_fps, original_fps=dada_cfg.FPS,
-                img_size=IMG_SIZE, is_train=True,
-            )
-            extra_train_datasets.append(("DADA", dada_train_ds))
-            logger.info(f"  DADA train: {len(dada_train_ds)} windows")
-        else:
-            logger.warning(f"  DADA 标注文件不存在: {dada_cfg.ANN_TRAIN}")
-
     if extra_train_datasets:
         from torch.utils.data import ConcatDataset
         all_train_parts = [train_ds] + [ds for _, ds in extra_train_datasets]
@@ -1231,13 +933,13 @@ def train(args):
 
     # ---- 混合数据集正负样本平衡（可选）----
     # balance_mix > 0 时启用：欠采样多数类使正负比达到 1:balance_mix
-    # 欠采样正样本时按优先级：先减 DoTA → 再减 Nexar → 保留 DADA 全部
+    # 欠采样正样本时按优先级：先减 DoTA → 再减 Nexar
     if args.balance_mix > 0:
         # 支持 ConcatDataset 和普通 Dataset
         candidate_datasets = train_ds.datasets if hasattr(train_ds, 'datasets') else [train_ds]
 
         # 识别每个子数据集的来源名称
-        # ConcatDataset 中的顺序: [Nexar, DoTA(可选), DADA(可选)]
+        # ConcatDataset 中的顺序: [Nexar, DoTA(可选)]
         ds_names = []
         if hasattr(train_ds, 'datasets'):
             # 第一个始终是 Nexar
@@ -1294,14 +996,14 @@ def train(args):
             logger.info(f"  策略: 欠采样负样本 {n_neg} → {len(neg_indices)}")
         else:
             # 正样本更多 → 按优先级欠采样正样本
-            # 优先级: 先减 DoTA → 再减 Nexar → DADA 全保留
+            # 优先级: 先减 DoTA → 再减 Nexar
             target_pos = int(n_neg * args.balance_mix)
             need_to_remove = n_pos - target_pos
 
             logger.info(f"  策略: 欠采样正样本 {n_pos} → {target_pos} (需移除 {need_to_remove})")
 
-            # 按优先级排序: DoTA 先减，Nexar 其次，DADA 最后
-            remove_priority = ["DoTA", "Nexar", "DADA"]
+            # 按优先级排序: DoTA 先减，Nexar 其次
+            remove_priority = ["DoTA", "Nexar"]
             removed_count = {}
             indices_to_remove = set()
 
@@ -1334,55 +1036,6 @@ def train(args):
         logger.info(f"  平衡后: pos={len(pos_indices)}, neg={len(neg_indices)}, "
                     f"total={len(balanced_indices)}, "
                     f"ratio={len(pos_indices)}:{len(neg_indices)}")
-
-    # ---- DADA-1000 验证数据集（可选）----
-    dada_val_ds = None
-    dada_val_loader = None
-    dada_loss_fn = None
-    if args.eval_dada:
-        logger.info("[DADA-1000] 加载 DADA-1000 验证数据集...")
-        if args.global_16f:
-            dada_val_ds = DADAGlobalDataset(
-                ann_file=dada_cfg.ANN_TEST,
-                rgb_root=dada_cfg.DATA_ROOT_TEST,
-                attn_root=dada_cfg.ATTN_ROOT_TEST,
-                target_frames=dada_cfg.GLOBAL_16F_NUM_FRAMES,
-                sample_fps=args.sample_fps,
-                original_fps=dada_cfg.FPS,
-                img_size=IMG_SIZE,
-                is_train=False,
-            )
-        elif args.global_mode:
-            dada_val_ds = DADAGlobalDataset(
-                ann_file=dada_cfg.ANN_TEST,
-                rgb_root=dada_cfg.DATA_ROOT_TEST,
-                attn_root=dada_cfg.ATTN_ROOT_TEST,
-                target_frames=dada_cfg.GLOBAL_NUM_FRAMES,
-                sample_fps=args.sample_fps,
-                original_fps=dada_cfg.FPS,
-                img_size=IMG_SIZE,
-                is_train=False,
-            )
-        else:
-            dada_val_ds = DADAVideoMAEDataset(
-                ann_file=dada_cfg.ANN_TEST,
-                rgb_root=dada_cfg.DATA_ROOT_TEST,
-                attn_root=dada_cfg.ATTN_ROOT_TEST,
-                window_size=WINDOW_SIZE,
-                window_stride=args.window_stride,
-                sample_fps=args.sample_fps,
-                original_fps=dada_cfg.FPS,
-                img_size=IMG_SIZE,
-                is_train=False,
-            )
-        dada_val_loader = DataLoader(
-            dada_val_ds, batch_size=VAL_BATCH_SIZE, shuffle=False,
-            num_workers=NUM_WORKERS, pin_memory=True,
-            worker_init_fn=worker_init_fn, collate_fn=collate_fn,
-        )
-        dada_loss_fn = ExpLossDADA(loss_scale=args.loss_scale)
-        dada_clips = dada_val_ds.dataset.clips if hasattr(dada_val_ds, 'dataset') else dada_val_ds.clips
-        logger.info(f"[DADA-1000] Val windows: {len(dada_val_ds)}, Val clips: {len(dada_clips)}")
 
     # ---- Debug 模式 ----
     if args.debug:
@@ -1451,18 +1104,6 @@ def train(args):
             window_size=actual_window_size,
             disable_gcn=args.no_gcn, random_roi=args.random_roi,
         ).to(device)
-
-    # ---- 从 DADA-1000 预训练 checkpoint 初始化（迁移学习）----
-    if args.pretrained_dada:
-        logger.info(f"从 DADA-1000 预训练 checkpoint 初始化: {args.pretrained_dada}")
-        ckpt = torch.load(args.pretrained_dada, map_location=device)
-        state_dict = ckpt.get("model", ckpt)
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        if missing:
-            logger.info(f"  缺失的权重键: {missing[:5]}...")
-        if unexpected:
-            logger.info(f"  多余的权重键: {unexpected[:5]}...")
-        logger.info("  DADA-1000 预训练权重加载完成")
 
     # ---- 冻结 backbone 前 N 层 ----
     if args.freeze_backbone_layers > 0:
@@ -1584,24 +1225,12 @@ def train(args):
             dataset_name="Nexar"
         )
 
-        # ---- 验证（DADA-1000，可选）----
-        dada_val_AP = 0.0
-        if dada_val_loader is not None:
-            dada_val_loss, dada_val_AP, dada_val_mTTA = validate(
-                model, dada_val_loader, dada_val_ds, dada_loss_fn, device, logger,
-                sample_fps=args.sample_fps, original_fps=dada_cfg.FPS,
-                dataset_name="DADA"
-            )
-
         elapsed = time.time() - t0
         train_avg_loss = epoch_loss / max(epoch_samples, 1)
-        dada_info = ""
-        if dada_val_loader is not None:
-            dada_info = f" | DADA: AP={dada_val_AP:.4f}"
         logger.info(
             f"Epoch {epoch+1}/{args.epochs} [{elapsed:.0f}s] "
             f"train_loss={train_avg_loss:.4f} val_loss={val_loss:.4f} "
-            f"Nexar: AP={val_AP:.4f} mTTA={val_mTTA:.2f}s{dada_info}"
+            f"Nexar: AP={val_AP:.4f} mTTA={val_mTTA:.2f}s"
         )
 
         # ---- 保存 checkpoint ----
@@ -1617,7 +1246,6 @@ def train(args):
             "val_loss": val_loss,
             "val_AP": val_AP,
             "val_mTTA": val_mTTA,
-            "dada_val_AP": dada_val_AP if dada_val_loader is not None else None,
             "config": {
                 "model": args.model,
                 "batch_size": args.batch_size,
@@ -1629,7 +1257,6 @@ def train(args):
                 "global_16f": args.global_16f,
                 "freeze_backbone_layers": args.freeze_backbone_layers,
                 "no_gcn": args.no_gcn,
-                "eval_dada": args.eval_dada,
                 "dataset": "nexar_clips_5s",
             },
         }

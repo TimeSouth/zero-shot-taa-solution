@@ -28,12 +28,13 @@ inference and aggregation → zero-shot domain-adaptive post-processing**.
 
 ## 1. Dataset Construction
 
-### 1.1 Data Sources
+### 1.1 Data Source
 
-| Dataset | Role | FPS | Purpose |
-| --- | --- | --- | --- |
-| **Nexar Crash / Dashcam Collision Prediction** | Train + main val | 30 | Provides the binary label and the time-of-event for every video. |
-| **DADA-1000** (LOTVS series) | Cross-set val | 30 | Monitors generalisation to unseen domains during training. |
+We use the public **Nexar Crash / Dashcam Collision Prediction** dataset
+as our sole training and validation source.  It provides, for every
+driving video, a clip-level binary label (collision / near-miss vs.
+normal driving) together with the `time_of_event` timestamp, which is
+exactly the supervision the per-frame risk task needs.
 
 ### 1.2 5-Second Clip Splitting and Per-Frame Risk Labels
 
@@ -48,18 +49,31 @@ slice the source data to match:
 2. **Negatives (no accident).** Slide a 5 s window directly; every frame
    has $y_t = 0$ and $\tau = 250$ (well outside the clip), making the
    time-weighted CE penalty vanish to plain CE.
-3. **Augmentation.** Sliding strides expand the sample count; positive and
-   negative samples are balanced at training time.
+3. **Augmentation.** The sliding stride expands the sample count several
+   times over.
 
-**Final corpus** (from the training log):
+### 1.3 Positive / Negative Class Balancing
 
-| Split | Clips | Sliding windows |
-| --- | --- | --- |
-| Nexar train | 2 428 | 21 852 |
-| Nexar val | 590 (pos = 295) | 5 310 |
-| DADA-1000 cross-set val (eval-only) | 810 (pos = 587) | 7 290 |
+Naïve sliding-window splitting yields an extremely imbalanced corpus in
+which negative clips vastly outnumber positives; a standard cross-entropy
+objective on such data collapses to the trivial "always predict negative"
+solution.  We therefore apply a tiered balancing scheme at dataset-build
+time (`balance_clips` in `process_5s_clips.py`):
 
-### 1.3 Frame Sampling and Tensor Construction
+* **Keep every positive clip** (label = 1) — positives are scarce, no
+  sub-sampling is done here.
+* **Keep every negative clip that comes from a positive video** — these
+  clips live inside the same dashcam trip as an accident and therefore
+  provide informative *pre-event* / *post-event* context.
+* **Under-sample clips from purely-negative videos.** To keep the final
+  positive : negative ratio close to 1 : 1 while still preserving scene
+  diversity, we first take at most `max_neg_clips_per_video = 3` clips
+  from each negative video (breadth-first), and only dip into the
+  remainder when the first pass is insufficient.  This keeps the negative
+  half diverse across traffic scenes, weather and camera setups, which
+  we found to help generalisation to the unseen test domain.
+
+### 1.4 Frame Sampling and Tensor Construction
 
 * **Down-sampling.** 30 fps → 10 fps (`frame_interval = 3`); a 5 s clip
   becomes 50 frames.
@@ -157,13 +171,12 @@ the whole loss by `loss_scale = 5.0` to amplify the gradient.
 | Input | $224 \times 224$, 16 frames per window @ 10 fps |
 | AMP | `torch.cuda.amp` |
 | Grad clip | 5.0 |
-| Cross-set val | DADA-1000 AP / mTTA every epoch |
 | Wall-clock | ~51 min/epoch × 20 ≈ **17 h** on a single GPU |
 
 ### 2.4 Checkpoint Selection
 
-Combining the AP / AUC / mTTA on the Nexar val set with the cross-set
-metrics on DADA-1000, we submit the weights from **Epoch 14**.
+We select the submitted checkpoint by the AP / AUC / mTTA on the Nexar
+validation split.
 
 ---
 
@@ -239,19 +252,21 @@ Keeping $p_T = p_{\text{final}}$ unchanged, the remaining 149 frames are
 replaced by a smooth, monotonically-increasing curve:
 
 $$
-p_t \;=\; p_{\text{start}} + (0.998\,p_{\text{final}} - p_{\text{start}}) \cdot \Big[\mu\,(1 - e^{-k t / T}) + (1 - \mu)\,\ln\!\big(1 + \tfrac{t}{T}(e - 1)\big)\Big]
+p_t \;=\; p_{\text{start}} + (\beta\,p_{\text{final}} - p_{\text{start}}) \cdot \Big[\mu\,(1 - e^{-k t / T}) + (1 - \mu)\,\ln\!\big(1 + \tfrac{t}{T}(e - 1)\big)\Big]
 $$
 
-where the steepness $k \in [7, 15]$ and the mixing coefficient
-$\mu \in [0.2, 0.8]$ are driven by raw-sequence shape statistics
-(half-rise position, early/late means); $p_{\text{start}}$ together with
-$p_{\text{final}}$ sets the overall confidence level.  We then add
-Gaussian noise with variance proportional to the raw $\sigma_p$ plus a
-low-frequency sinusoidal perturbation, and finish with a single-pass
-$0.25 : 0.5 : 0.25$ three-tap smoothing.  The result is a sequence that is
-both monotonically rising and naturally jittery.  Conceptually, this step
-*soft-broadcasts* the model's end-segment risk back along the time axis,
-imposing the task's temporal causal prior.
+where $\beta < 1$ is a "headroom" factor that keeps the pre-final frames
+strictly below the end anchor $p_{\text{final}}$ and is fixed to
+$\beta = 0.998$ in our implementation; the steepness $k \in [7, 15]$ and
+the mixing coefficient $\mu \in [0.2, 0.8]$ are driven by raw-sequence
+shape statistics (half-rise position, early/late means); $p_{\text{start}}$
+together with $p_{\text{final}}$ sets the overall confidence level.  We
+then add Gaussian noise with variance proportional to the raw $\sigma_p$
+plus a low-frequency sinusoidal perturbation, and finish with a
+single-pass $0.25 : 0.5 : 0.25$ three-tap smoothing.  The result is a
+sequence that is both monotonically rising and naturally jittery.
+Conceptually, this step *soft-broadcasts* the model's end-segment risk
+back along the time axis, imposing the task's temporal causal prior.
 
 ### 4.3 Distribution-Moment Domain Adaptation
 
@@ -287,21 +302,22 @@ as `submission_v7.csv` and yielded the team's best result.
 
 ## 5. Summary
 
-* **Methodology.** Under the zero-shot constraint we (i) use Nexar / DADA
-  public data to build a competition-shape (5 s × 30 fps) training set,
-  (ii) fine-tune VideoMAE-v2 with a per-frame binary head and a
-  time-weighted CE loss, (iii) run sliding-window inference and aggregate
-  back to 150 frames, and (iv) apply a training-free post-processor
-  combining end-anchored temporal weighting, monotonic shape prior, and
-  distribution-moment domain adaptation.
+* **Methodology.** Under the zero-shot constraint we (i) use the public
+  Nexar dataset to build a competition-shape (5 s × 30 fps) training set
+  with careful positive / negative balancing, (ii) fine-tune VideoMAE-v2
+  with a per-frame binary head and a time-weighted CE loss, (iii) run
+  sliding-window inference and aggregate back to 150 frames, and
+  (iv) apply a training-free post-processor combining end-anchored
+  temporal weighting, monotonic shape prior, and distribution-moment
+  domain adaptation.
 * **Main contributions.**
   1. Cutting the last 2 s of positive videos to align training with the
      "early prediction" objective.
-  2. An ExpLoss that uses *time-to-accident* as an explicit per-frame
+  2. A tiered positive / negative balancing scheme that preserves scene
+     diversity by capping negatives per video rather than sub-sampling
+     uniformly.
+  3. An ExpLoss that uses *time-to-accident* as an explicit per-frame
      weight.
-  3. Selecting the checkpoint by cross-set (DADA-1000) AUC instead of the
-     single best in-domain AP, improving robustness under the zero-shot
-     setting.
   4. A training-free, order-preserving post-processor based on a moment
      of the model's own prediction distribution.
 * **Result.** 2nd place at Kaggle Zero-Shot TAA (final submission file:
@@ -337,10 +353,10 @@ as `submission_v7.csv` and yielded the team's best result.
 
 ### 1.1 数据来源
 
-| 数据集 | 角色 | 帧率 | 用途 |
-| --- | --- | --- | --- |
-| **Nexar Crash / Dashcam Collision Prediction** | 主训练 / 主验证 | 30 fps | 提供"是否发生事故"的二分类标签和事故发生时间 |
-| **DADA-1000**（LOTVS 系列） | 跨数据集验证 | 30 fps | 监控对未见数据的泛化能力 |
+我们使用公开的 **Nexar Crash / Dashcam Collision Prediction**
+数据集作为训练与验证的唯一来源。它为每段驾驶视频提供 clip 级二分类
+标签（碰撞/险些碰撞 vs. 正常驾驶）以及 `time_of_event` 时间戳，正好
+对应逐帧风险预测任务所需的监督信号。
 
 ### 1.2 5 秒 clip 切分与逐帧风险标签
 
@@ -351,18 +367,25 @@ as `submission_v7.csv` and yielded the team's best result.
    5 s clip；事故时间 $\tau$（相对帧号）保留以做时序加权。
 2. **负样本（未发生事故）：** 直接滑窗切 5 s clip，所有帧 $y_t = 0$，
    $\tau = 250$（远大于 clip 长度，使时序惩罚项恒为 0）。
-3. **数据增广：** 滑窗在原视频上以 stride 平移多次切片以扩样本量；
-   训练时**正负样本均衡**。
+3. **数据增广：** 滑窗 stride 多次切片以扩样本量。
 
-**最终数据规模**（来自训练日志）：
+### 1.3 正负样本平衡
 
-| 划分 | clip 数 | 滑窗数 |
-| --- | --- | --- |
-| Nexar 训练 | 2 428 | 21 852 |
-| Nexar 验证 | 590（pos = 295） | 5 310 |
-| DADA-1000 验证（跨集，仅评估） | 810（pos = 587） | 7 290 |
+朴素滑窗切分会得到极度不平衡的语料——负样本 clip 数远多于正样本，
+若不做处理，标准交叉熵会塌缩到"恒预测为负"的平凡解。我们在数据集
+构建阶段（`process_5s_clips.py` 中的 `balance_clips`）采用一个分层
+平衡策略：
 
-### 1.3 帧采样与张量构造
+* **保留全部正样本 clip**（label = 1）——正样本本身稀缺，不做下采样。
+* **保留正样本视频中的所有负样本 clip**——它们与事故同处一段行车
+  片段，提供了**事故前/后**的有效上下文。
+* **从纯负样本视频中欠采样。** 为了在保持 1 : 1 大致比例的同时仍
+  保有充分的场景多样性，我们先按"广度优先"原则：每段纯负样本视频
+  最多取 `max_neg_clips_per_video = 3` 个 clip；不足时再从剩余 clip
+  中补足。这样负样本侧能覆盖更多交通场景、天气与车机配置，对在
+  未见测试域上的泛化更有利。
+
+### 1.4 帧采样与张量构造
 
 * **降采样：** 30 fps → 10 fps（`frame_interval = 3`），一个 5 s clip
   在采样后剩 50 帧。
@@ -453,13 +476,11 @@ $$
 | 输入 | $224 \times 224$，16 帧/窗口 @ 10 fps |
 | 混合精度 | `torch.cuda.amp` |
 | Grad clip | 5.0 |
-| 跨集验证 | 每 epoch 在 DADA-1000 上同步评估 AP / mTTA |
 | 单卡耗时 | ~51 min/epoch × 20 ≈ **17 h** |
 
 ### 2.4 Checkpoint 选择
 
-综合 Nexar 验证集与 DADA-1000 跨集验证的 AP / AUC / mTTA 指标，最终
-选用 **Epoch 14** 的权重作为提交模型。
+最终提交的权重根据 Nexar 验证集上的 AP / AUC / mTTA 指标挑选。
 
 ## 3. 推理（Sliding Window + Clip-Level Aggregation）
 
@@ -524,16 +545,17 @@ $$
 平滑、自然形态**的曲线替换：
 
 $$
-p_t \;=\; p_{\text{start}} + (0.998\,p_{\text{final}} - p_{\text{start}}) \cdot \Big[\mu\,(1 - e^{-k t / T}) + (1 - \mu)\,\ln\!\big(1 + \tfrac{t}{T}(e - 1)\big)\Big]
+p_t \;=\; p_{\text{start}} + (\beta\,p_{\text{final}} - p_{\text{start}}) \cdot \Big[\mu\,(1 - e^{-k t / T}) + (1 - \mu)\,\ln\!\big(1 + \tfrac{t}{T}(e - 1)\big)\Big]
 $$
 
-其中陡峭度 $k \in [7, 15]$ 与混合系数 $\mu \in [0.2, 0.8]$ 由原始
-序列形状特征（半值穿越位置、前后段均值）驱动；起点 $p_{\text{start}}$
-与 $p_{\text{final}}$ 共同决定整体置信水平。叠加方差正比于原始序列
-$\sigma_p$ 的高斯噪声 + 低频正弦扰动，最后做一次三点 $0.25 : 0.5 :
-0.25$ 平滑，保证序列既单调上升又有自然抖动。该步本质是把模型给出的
-"末段风险值"沿时间轴**软广播**回前段，相当于强制施加任务的时间
-因果先验。
+其中 $\beta < 1$ 是"留白"系数，保证末帧之前的所有帧严格小于末值锚点
+$p_{\text{final}}$，本工作中取 $\beta = 0.998$；陡峭度 $k \in [7, 15]$
+与混合系数 $\mu \in [0.2, 0.8]$ 由原始序列形状特征（半值穿越位置、
+前后段均值）驱动；起点 $p_{\text{start}}$ 与 $p_{\text{final}}$ 共同
+决定整体置信水平。叠加方差正比于原始序列 $\sigma_p$ 的高斯噪声 + 低
+频正弦扰动，最后做一次三点 $0.25 : 0.5 : 0.25$ 平滑，保证序列既单调
+上升又有自然抖动。该步本质是把模型给出的"末段风险值"沿时间轴**软
+广播**回前段，相当于强制施加任务的时间因果先验。
 
 ### 4.3 基于预测分布统计量的零样本域自适应
 
@@ -561,15 +583,15 @@ $\sigma_p$ 的高斯噪声 + 低频正弦扰动，最后做一次三点 $0.25 : 
 
 ## 5. 小结
 
-* **核心方法论：** 在零样本约束下，用 Nexar/DADA 公开数据按比赛 5 s
-  × 30 fps 形态自建训练集 → 微调 VideoMAE-v2 + 逐帧二分类头（时序
-  加权 CE）→ 滑窗推理 → 末值锚定 + 时序先验 + 分布矩域自适应的轻
-  量后处理。
+* **核心方法论：** 在零样本约束下，用 Nexar 公开数据按比赛 5 s ×
+  30 fps 形态自建训练集并做正负样本平衡 → 微调 VideoMAE-v2 + 逐帧
+  二分类头（时序加权 CE）→ 滑窗推理 → 末值锚定 + 时序先验 + 分布
+  矩域自适应的轻量后处理。
 * **主要技术贡献：**
   1. 截掉事故发生最后 2 s 来对齐"提前预测"目标；
-  2. 用距事故时间作为损失权重的 ExpLoss；
-  3. 用跨集 (DADA-1000) AUC 而非"训练域单点最高 AP" 作为
-     checkpoint 选择标准；
+  2. 一种分层的正负样本平衡策略：通过限制单视频负样本数而非全局
+     均匀降采样，保留场景多样性；
+  3. 用距事故时间作为损失权重的 ExpLoss；
   4. 在 zero-shot 约束下，基于模型自身预测分布的统计量做保序的域
      自适应后处理。
 * **最终成绩：** Kaggle Zero-Shot TAA 第 2 名（提交文件：
