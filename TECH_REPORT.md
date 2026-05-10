@@ -328,13 +328,18 @@ test time the predicted clip-level probability is replicated to all
 150 output positions.  This variant is referred to as **Late-Window**
 below.
 
-**Result.** Late-Window converges to a higher *clip-level* validation
-accuracy than our default per-frame model (positive samples in the
-final 2 s are visually decisive), but its frame-level AP and mTTA both
-*decrease* relative to A1 — the constant-probability output has no
-temporal resolution by construction, and any post-processor that tries
-to recover a rising curve from a flat one (cf. §4.2) collapses to a
-single anchor value.
+**Result.** Trained for 10 epochs on the same Nexar split with a
+class-balanced training corpus (914 samples, 457 positive / 457
+negative), Late-Window converges to a strong **clip-level** validation
+score of $\text{AUC}=0.879$ and $\text{AP}=0.640$ at epoch 9
+(measured in $[0,1]$, sklearn-style).  These numbers are not directly
+comparable in absolute scale to the frame-level, competition-style
+AP of A1 (which can exceed 1), but they confirm that the late-window
+*classifier* itself is well-fit.  Crucially, the resulting flat 150-
+frame output sequence has, by construction, no temporal resolution at
+all, so any post-processor that tries to recover a rising curve from a
+constant one (cf. §4.2) collapses to a single anchor value and loses
+the mTTA signal.
 
 **Discussion.** This experiment confirms a hypothesis that is implicit
 in our final design: under the zero-shot setting, the test domain
@@ -683,11 +688,15 @@ $p_{\text{final}}$，本工作中取 $\beta = 0.998$；陡峭度 $k \in [7, 15]$
 clip 级概率沿时间轴复制到全部 150 个输出位置。下文称该变体为
 **Late-Window**。
 
-**结果。** Late-Window 在 *clip 级* 验证准确率上反而高于我们默认的
-逐帧模型——最后 2 s 内的正样本视觉信号确实足够决定性。但其帧级 AP
-与 mTTA 相对 §5 主流水线均出现下降：复制得到的常数概率序列在结构
-上不具备任何时序分辨率，§4.2 中那种"从平直序列恢复上升曲线"的后
-处理只能塌缩到一个锚点值。
+**结果。** 在与最终模型相同的 Nexar 划分上，使用同样平衡后的训练集
+（914 样本，正负各 457）训练 10 epoch，Late-Window 在 epoch 9 达到了
+不错的 **clip 级** 指标：$\text{AUC}=0.879$, $\text{AP}=0.640$
+（$[0,1]$ 范围、sklearn 标准 AP）。这些数值与最终模型的**帧级、比赛
+口径** AP（值可大于 1）不在同一尺度上，不能直接横向比较，但足以
+说明该 clip 级分类器本身收敛良好。然而，由于该模型沿时间轴复制
+clip 级概率，得到的 150 帧序列在结构上**完全没有时序分辨率**——
+§4.2 中"从平直序列恢复上升曲线"的后处理只能塌缩到一个锚点值，
+mTTA 信号无从产生。
 
 **讨论。** 该实验印证了我们在最终设计中的一个隐含假设：在零样本
 设定下，测试域包含相当比例的*正常驾驶* clip，这些 clip 在最后 2 s
