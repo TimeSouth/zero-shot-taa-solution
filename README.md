@@ -58,7 +58,7 @@ ablations it consistently outperformed CNN+LSTM and CNN+attention baselines.
 │
 ├── nexar_config.py                 # central config (paths via env vars)
 ├── nexar_dataset.py                # train/val Dataset
-├── videomae_gcn.py                 # VideoMAE-v2 backbone + per-frame head
+├── videomae_model.py               # VideoMAE-v2 backbone + per-frame head
 │
 ├── process_5s_clips.py             # Stage 1: dataset construction
 ├── nexar_train.py                  # Stage 2: training entry point

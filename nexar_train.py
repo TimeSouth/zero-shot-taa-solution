@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from nexar_config import *
 from nexar_dataset import NexarVideoMAEDataset, NexarGlobalDataset, NexarLast2sDataset
-from videomae_gcn import (
+from videomae_model import (
     VideoMAEGCNModel, VideoMAEGCNModelV2, freeze_backbone_layers,
     get_videomae_backbone, get_inner_model, extract_videomae_tokens,
 )

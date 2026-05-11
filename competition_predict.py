@@ -38,7 +38,7 @@ from nexar_config import (
     FUSION_DIM, IMG_SIZE, WINDOW_SIZE, SAMPLE_FPS, FPS, USE_AMP,
     GLOBAL_16F_NUM_FRAMES, NUM_WORKERS,
 )
-from videomae_gcn import VideoMAEGCNModel, VideoMAEGCNModelV2
+from videomae_model import VideoMAEGCNModel, VideoMAEGCNModelV2
 
 
 # ============ 数据结构 ============
