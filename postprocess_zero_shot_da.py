@@ -2,8 +2,8 @@
 Stage 4 — Zero-shot domain-adaptive post-processing.
 
 Transforms the raw per-frame risk sequences produced by
-`competition_predict.py` into the final submission file.  Implements the
-three steps described in Section 4 of `TECH_REPORT.md`:
+`competition_predict.py` into the final submission file.  Implements
+three calibration steps:
 
     (1) End-anchored temporal weighting             (Section 4.1)
     (2) End-anchored monotonic shape prior          (Section 4.2)

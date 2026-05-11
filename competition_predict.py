@@ -4,7 +4,7 @@ Stage 3 — Inference on the competition test set.
 Runs sliding-window inference on every 150-frame test clip, then aggregates
 the window-level outputs back to a per-frame risk sequence via overlap
 averaging and linear interpolation.  The output CSV matches the submission
-format expected by the competition.  See Section 3 of `TECH_REPORT.md`.
+format expected by the competition.
 """
 
 import argparse

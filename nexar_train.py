@@ -2,7 +2,7 @@
 Stage 2 — Training entry point.
 
 Fine-tunes VideoMAE-v2 + per-frame classifier on the 5 s Nexar clips
-produced by `process_5s_clips.py`.  See Section 2 of `TECH_REPORT.md`.
+produced by `process_5s_clips.py`.
 """
 
 import argparse
@@ -45,7 +45,7 @@ from videomae_gcn import (
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Nexar 5s Clip VideoMAE+GCN 训练")
+    parser = argparse.ArgumentParser(description="Nexar 5s Clip VideoMAE 训练")
     parser.add_argument("--model", choices=["v1", "v2"], default="v2",
                         help="模型版本: v1=窗口级预测, v2=逐帧预测")
     parser.add_argument("--backbone", choices=["base", "giant"], default="base",
@@ -71,7 +71,9 @@ def parse_args():
     parser.add_argument("--clip_weight", type=float, default=0.0,
                         help="Clip 级别约束权重")
     parser.add_argument("--no_gcn", action="store_true",
-                        help="禁用 GCN 分支（推荐，因为 Nexar 无 attention map）")
+                        help="Disable the auxiliary branch (recommended; "
+                             "kept as a CLI flag for backward compatibility "
+                             "with earlier checkpoints).")
     parser.add_argument("--random_roi", action="store_true",
                         help="消融实验: ROI 使用随机采样")
     # ---- 混合数据集训练 ----
@@ -836,7 +838,7 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     logger.info("=" * 60)
-    logger.info(f"Nexar 5s Clip VideoMAE+GCN Training (model={args.model})")
+    logger.info(f"Nexar 5s Clip VideoMAE Training (model={args.model})")
     if args.exp_name:
         logger.info(f"Experiment: {args.exp_name}")
     logger.info(f"Device: {device}")

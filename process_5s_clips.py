@@ -7,7 +7,7 @@ share the exact temporal layout of the competition test set
 same Dataset class can read both Nexar and DADA-1000.
 
 For positive videos we cut off the last 2 s before slicing, so the model
-never sees the collision frames.  See Section 1 of `TECH_REPORT.md`.
+never sees the collision frames.
 """
 
 import os

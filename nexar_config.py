@@ -9,15 +9,12 @@ Environment variables
     CLIPS_ROOT      Root directory for the Nexar 5s-clip dataset produced by
                     `process_5s_clips.py`.  Defaults to ``./data/nexar_clips_5s``
                     relative to this file.
-    DADA_ROOT       (optional) Root directory of DADA-1000, used only for the
-                    cross-dataset validation that runs each epoch.  Defaults to
-                    ``./data/DADA-1000``.
 
 Usage
 -----
     # one-shot override
     export CLIPS_ROOT=/path/to/nexar/clips_5s
-    python nexar_train.py --no_gcn --eval_dada
+    python nexar_train.py
 """
 
 import os
@@ -32,9 +29,9 @@ CLIPS_ROOT = os.environ.get(
 DATA_ROOT_TRAIN = os.path.join(CLIPS_ROOT, "training", "rgb_videos")
 DATA_ROOT_TEST  = os.path.join(CLIPS_ROOT, "testing",  "rgb_videos")
 
-# Nexar has no driver-attention map; the GCN branch is disabled at runtime
-# (`--no_gcn`).  These dirs only need to exist so that loading code does not
-# crash; they may be empty.
+# Auxiliary attention-map directories (kept for compatibility with the loader
+# signature; in this work Nexar provides no per-frame attention so these dirs
+# may be empty).
 ATTN_ROOT_TRAIN = os.path.join(CLIPS_ROOT, "training", "attention_maps")
 ATTN_ROOT_TEST  = os.path.join(CLIPS_ROOT, "testing",  "attention_maps")
 
@@ -55,7 +52,8 @@ FRAME_COUNT = 16        # Number of frames a single VideoMAE forward consumes
 FPS         = 30        # Native FPS of every clip in clips_5s (target_fps=30)
 SAMPLE_FPS  = 10        # Down-sampled FPS used during training (30 -> 10)
 
-# GCN branch parameters (disabled in this work via `--no_gcn`).
+# Auxiliary branch parameters (kept for compatibility; the auxiliary branch is
+# disabled at runtime in this work via the `--no_gcn` flag).
 NUM_ROIS    = 12
 ROI_SIZE    = 7
 GCN_HIDDEN  = 256

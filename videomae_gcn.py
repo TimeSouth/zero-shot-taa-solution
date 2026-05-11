@@ -1,10 +1,13 @@
 """
-VideoMAE + Attention-ROI-GCN 融合模型
+VideoMAE-v2 backbone with an optional auxiliary fusion branch.
 
-架构:
-  1. VideoMAE 分支: VideoMAEv2-base → 时空 token → 全局池化 → 768维全局特征
-  2. GCN 分支: Attention Map → Top-K ROI 选择 → RoIAlign 提取局部特征 → GCN 图推理 → 空间推理特征
-  3. 门控融合: gate * videomae_feat + (1-gate) * gcn_feat → MLP → 逐帧事故概率
+In this work the auxiliary branch is disabled at runtime via the
+``--no_gcn`` flag, so the effective forward graph reduces to:
+
+    RGB clip -> VideoMAE-v2 -> token features -> per-frame fusion -> head
+
+The auxiliary branch and its module classes are kept here only for
+backward compatibility with earlier checkpoints.
 """
 
 import math
@@ -429,12 +432,12 @@ def extract_videomae_tokens(backbone, x):
 
 class VideoMAEGCNModel(nn.Module):
     """
-    VideoMAE + Attention-ROI-GCN 双分支融合模型。
+    VideoMAE-v2 based clip-level accident-risk model.
 
-    前向流程:
-    1. VideoMAE 分支: RGB → VideoMAEv2 → token features → 池化 → 全局特征 (768)
-    2. GCN 分支: Attention Map → ROI 选择 → RoIAlign → GCN 推理 → 空间特征
-    3. 门控融合 → MLP → 逐帧事故概率
+    Forward pipeline (when the auxiliary branch is enabled):
+    1. VideoMAE-v2 -> token features -> mean pool -> global feature (768)
+    2. Optional auxiliary branch (kept for backward compatibility)
+    3. Gated fusion -> MLP -> per-frame accident probability
     """
 
     def __init__(
@@ -551,8 +554,9 @@ class VideoMAEGCNModel(nn.Module):
 
 class VideoMAEGCNModelV2(nn.Module):
     """
-    V2 版本: 逐帧预测，使用时间感知的融合。
-    每帧的 ROI 特征 + 全局特征 → 逐帧独立预测。
+    V2 model: per-frame prediction with time-aware fusion.
+    Each frame's feature is fused independently to produce a per-frame
+    accident-risk score.
 
     支持两种模式:
     - 滑动窗口模式 (window_size=16): 与原始行为一致

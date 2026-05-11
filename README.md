@@ -11,8 +11,6 @@ traffic-accident-anticipation challenge. Given a 5-second dashcam clip
 (150 frames @ 30 fps) the model outputs a per-frame risk score
 $r_t \in [0,1]$ for $t = 1,\dots,150$.
 
-The full method is documented in [`TECH_REPORT.md`](./TECH_REPORT.md).
-
 ## Solution Overview
 
 The competition supplies no training set. Our pipeline therefore has four
@@ -23,9 +21,7 @@ stages, each implemented in exactly one script:
    2 s so the model never sees the collision frames; we then slide a 5 s
    window with 50% overlap and emit DADA-1000-style annotation lines.
 2. **Training** — Fine-tune **VideoMAE-v2 (Base)** on 16-frame windows with
-   a time-weighted cross-entropy loss (`ExpLoss`). The GCN branch of
-   `VideoMAEGCNModelV2` is disabled (`--no_gcn`) because Nexar provides no
-   driver-attention map.
+   a time-weighted cross-entropy loss (`ExpLoss`).
 3. **Inference** — Sliding-window inference on each 150-frame test clip,
    followed by overlap averaging and linear interpolation back to 150
    per-frame risk scores.
@@ -51,9 +47,6 @@ ablations it consistently outperformed CNN+LSTM and CNN+attention baselines.
 * **Hand-designed post-processing.** The zero-shot DA step is rule-based;
   replacing the empirical-median anchor with a learnable per-test-set
   calibration head is an obvious next step.
-* **No driver-attention modality.** Nexar lacks attention maps so the GCN
-  branch is switched off; we expect a moderate gain from re-enabling it on
-  a dataset (e.g. DADA-2000) that does provide gaze annotations.
 * **Single 16-frame window length.** No experiments on alternative window
   lengths or sampling rates were run due to compute budget.
 
@@ -62,7 +55,6 @@ ablations it consistently outperformed CNN+LSTM and CNN+attention baselines.
 ```
 .
 ├── README.md                       # this file
-├── TECH_REPORT.md                  # full technical report
 │
 ├── nexar_config.py                 # central config (paths via env vars)
 ├── nexar_dataset.py                # train/val Dataset
@@ -113,8 +105,6 @@ a single GPU for 20 epochs).
 基于 VideoMAE-v2 的逐帧事故风险预测方案。输入 5 s 驾驶员视角视频
 （150 帧 @ 30 fps），输出每一帧 $t$ 发生事故的概率 $r_t \in [0,1]$。
 
-完整方法描述见 [`TECH_REPORT.md`](./TECH_REPORT.md)。
-
 ## 方法概览
 
 本赛题不提供训练集。整个方案分四个阶段，每个阶段对应一个脚本：
@@ -123,7 +113,7 @@ a single GPU for 20 epochs).
    （5 s × 150 帧）的训练集；正样本截掉事故发生最后 2 s，避免模型看到爆炸瞬间；
    以 stride=2.5 s 滑窗扩样，生成 DADA-1000 风格的标注。
 2. **训练** — 在 16 帧窗口上微调 **VideoMAE-v2 (Base)**，使用时序加权
-   交叉熵 (`ExpLoss`)；Nexar 无注意力图，启用 `--no_gcn` 切除 GCN 分支。
+   交叉熵 (`ExpLoss`)。
 3. **推理** — 对每个 150 帧 clip 做滑动窗口推理→窗口级 risk score→
    重叠位置取均值→线性插值还原 150 帧。
 4. **零样本域自适应后处理** — 一个无训练的校准步骤：以末帧值锚定整段
@@ -143,9 +133,6 @@ VideoMAE-v2 是当前视频理解领域代表性的自监督预训练模型：�
 * **单模型提交，未做集成。**
 * **后处理基于规则**——可以考虑用可学习的 calibration head 替换"末值
   经验中位数"这一锚点。
-* **未利用驾驶员注意力**——Nexar 不提供 attention map，因此 GCN 分支
-  已被 `--no_gcn` 关闭；在 DADA-2000 这类提供注视图的数据上应能带来
-  增益。
 * **未尝试不同窗口长度。** 受限于算力，仅用了 16 帧窗口。
 
 ## 仓库结构
